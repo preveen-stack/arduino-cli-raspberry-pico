@@ -1,192 +1,94 @@
 #include <Arduino.h>
 #include <I2S.h>
+#include "hardware/structs/watchdog.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-  #include <hardware/watchdog.h>
-  #include <hardware/clocks.h>
-  #include <hardware/adc.h>
-  #include <hardware/gpio.h>
-#ifdef __cplusplus
-}
-#endif
-
+// I2S on Core 1
 I2S i2s(OUTPUT);
 
-// Global Variables
-unsigned long lastBlink = 0;
-int blinkFreq = 500; 
-bool blinkEnabled = true;
-bool ledState = LOW;
-int fadeValue = 0;
-int fadeDirection = 5;
-unsigned long lastFadeUpdate = 0;
-bool breathingEnabled = false;
-
-// Audio Variables
-bool toneRunning = false;
-float currentFreq = 440.0;
-float phase = 0;
-float phaseIncrement = 0;
+// Shared Global Variables (Thread-safe-ish for simple types)
+volatile bool toneRunning = false;
+volatile float currentFreq = 440.0;
+volatile float phase = 0;
+volatile float phaseIncrement = 0;
 int sampleRate = 44100;
-int bitDepth = 16;
 
-void updatePhaseIncrement() {
-  phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
-}
-
-void printHelp() {
-  Serial.println("\n========= PICO CONTROL MENU =========");
-  Serial.println("help             - Show this menu");
-  Serial.println("clock            - Show system clock speeds");
-  Serial.println("temp             - Read internal CPU temp");
-  Serial.println("blink on/off     - Toggle onboard LED");
-  Serial.println("blink freq <ms>  - Set LED rate (1-10000)");
-  Serial.println("led measure      - Measure LED pulse frequency");
-  Serial.println("reset            - Reboot the Pico");
-  Serial.println("\n--- I2S Commands ---");
-  Serial.println("i2s init <sr> <bw> <ch>");
-  Serial.println("i2s start/stop | i2s measure | i2s detail");
-  Serial.println("=====================================\n");
-}
-
-// New Function: Measure LED Frequency
-void measureLED() {
-  Serial.println("\n--- LED Frequency Measurement (GP25) ---");
-  
-  if (!blinkEnabled) {
-    Serial.println("Error: LED blinking is OFF.");
-    return;
-  }
-
-  float theoreticalFreq = 1000.0 / (blinkFreq * 2.0);
-  int pulses = 0;
-  bool lastState = ledState;
-  unsigned long start = millis();
-
-  Serial.println("Measuring for 2 seconds...");
-
-  while (millis() - start < 2000) {
-    // Keep the LED blinking logic alive during the measurement loop
-    if (millis() - lastBlink >= (unsigned long)blinkFreq) {
-      lastBlink = millis();
-      ledState = !ledState;
-      digitalWrite(LED_BUILTIN, ledState);
-    }
-
-    // Count the transitions
-    if (ledState != lastState) {
-      if (ledState == HIGH) pulses++;
-      lastState = ledState;
-    }
-    
-    // Tiny yield to keep the system stable
-    tight_loop_contents(); 
-  }
-
-  float measuredFreq = pulses / 2.0;
-
-  Serial.printf("Theoretical Freq: %.3f Hz\n", theoreticalFreq);
-  Serial.printf("Measured Freq:    %.3f Hz\n", measuredFreq);
-  Serial.println("----------------------------------------\n");
-}
-
-void measureI2S() {
-  Serial.println("\n--- I2S Hardware Clock Measurement ---");
-  uint32_t bclk_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 26);
-  uint32_t lrclk_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 27);
-  Serial.printf("BCLK (GP26):  %.3f MHz\n", bclk_khz / 1000.0);
-  Serial.printf("LRCLK (GP27): %u Hz\n", lrclk_khz * 1000);
-}
-
-void handleI2STone() {
-  if (!toneRunning) return;
-  while (i2s.availableForWrite()) {
-    int16_t sample = (int16_t)(sin(phase) * 32767.0f);
-    i2s.write(sample);
-    i2s.write(sample);
-    phase += phaseIncrement;
-    if (phase >= 2.0 * PI) phase -= 2.0 * PI;
-  }
-}
-
+// ==========================================
+// CORE 0: Serial Watch & Command Interface
+// ==========================================
 void setup() {
-  Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
-  adc_init();
-  adc_set_temp_sensor_enabled(true);
-  delay(2000);
-  Serial.println("Pico Online. Type 'help' to begin.");
+    // Check for saved clock speed from reset
+    uint32_t saved_freq = watchdog_hw->scratch[0];
+    if (saved_freq >= 10 && saved_freq <= 250) {
+        set_sys_clock_khz(saved_freq * 1000, true);
+    }
+
+    Serial.begin(115200);
+    // Wait for serial to be ready so we don't miss the first messages
+    while(!Serial && millis() < 3000); 
+    
+    Serial.println("\n[CORE 0] Serial Monitor Active");
 }
 
 void loop() {
-  if (blinkEnabled && (millis() - lastBlink >= (unsigned long)blinkFreq)) {
-    lastBlink = millis();
-    ledState = !ledState;
-    digitalWrite(LED_BUILTIN, ledState);
-  }
+    if (Serial.available() > 0) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+        
+        if (input == "help") {
+            Serial.println("Commands: i2s start, i2s stop, i2s tone <f>, reset to <mhz>");
+        } 
+        else if (input == "i2s start") {
+            toneRunning = true;
+            Serial.println("Audio Engine Triggered on Core 1");
+        }
+        else if (input == "i2s stop") {
+            toneRunning = false;
+        }
+        else if (input.startsWith("i2s tone ")) {
+            currentFreq = input.substring(9).toFloat();
+            phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
+            Serial.printf("Frequency set to %.1f Hz\n", currentFreq);
+        }
+        else if (input.startsWith("reset to ")) {
+            uint32_t mhz = input.substring(9).toInt();
+            watchdog_hw->scratch[0] = mhz;
+            watchdog_reboot(0,0,0);
+        }
+    }
+}
 
-  handleI2STone();
+// ==========================================
+// CORE 1: High-Priority Audio & Blink
+// ==========================================
+void setup1() {
+    // Core 1 setup runs slightly after Core 0
+    i2s.setDATA(28);
+    i2s.setBCLK(26);
+    i2s.begin(sampleRate);
+    
+    pinMode(LED_BUILTIN, OUTPUT);
+    
+    // Initial calculation
+    phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
+}
 
-  if (Serial.available() > 0) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    String cmd = input;
-    cmd.toLowerCase();
+void loop1() {
+    // 1. Audio Generation (Hard Real-Time)
+    if (toneRunning) {
+        while (i2s.availableForWrite()) {
+            int16_t sample = (int16_t)(sin(phase) * 32767.0f);
+            i2s.write(sample);
+            i2s.write(sample);
+            
+            phase += phaseIncrement;
+            if (phase >= 2.0 * PI) phase -= 2.0 * PI;
+        }
+    }
 
-    if (cmd == "help") printHelp();
-    else if (cmd == "clock") {
-       Serial.printf("\nSystem: %.2f MHz\n", rp2040.f_cpu() / 1000000.0);
+    // 2. Heartbeat LED (Moved here to ensure it doesn't block Serial)
+    static unsigned long lastBlink = 0;
+    if (millis() - lastBlink >= 500) {
+        lastBlink = millis();
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
     }
-    else if (cmd == "temp") {
-      adc_select_input(4);
-      uint16_t raw = adc_read();
-      float temp = 27.0f - ((raw * (3.3f / (1 << 12))) - 0.706f) / 0.001721f;
-      Serial.printf("CPU Temp: %.2f °C\n", temp);
-    }
-    else if (cmd == "led measure") measureLED();
-    else if (cmd == "blink on") blinkEnabled = true;
-    else if (cmd == "blink off") blinkEnabled = false;
-    else if (cmd.startsWith("blink freq ")) {
-      blinkFreq = cmd.substring(11).toInt();
-      Serial.printf("Blink interval: %d ms\n", blinkFreq);
-    }
-    else if (cmd.startsWith("i2s init ")) {
-      int s1 = cmd.indexOf(' ', 9);
-      sampleRate = cmd.substring(9, s1).toInt();
-      i2s.setDATA(28); i2s.setBCLK(26);
-      if (i2s.begin(sampleRate)) {
-        updatePhaseIncrement();
-        Serial.printf("I2S Ready: %dHz\n", sampleRate);
-      }
-    }
-    else if (cmd == "i2s start") toneRunning = true;
-    else if (cmd == "i2s stop") toneRunning = false;
-    else if (cmd == "i2s measure") measureI2S();
-    else if (cmd == "reset") watchdog_reboot(0,0,0);
-    else if (cmd == "blink breathe") {
-        breathingEnabled = true;
-        blinkEnabled = false; // Disable standard blink
-        analogWriteFreq(1000); // 1kHz carrier frequency
-        Serial.println("Breathing enabled.");
-    }
-    else if (cmd == "blink normal") {
-        breathingEnabled = false;
-        blinkEnabled = true;
-        digitalWrite(LED_BUILTIN, LOW);
-        Serial.println("Standard blink enabled.");
-    }
-  }
-
-  // Breathing Logic
-  if (breathingEnabled && (millis() - lastFadeUpdate >= 20)) {
-    lastFadeUpdate = millis();
-    analogWrite(LED_BUILTIN, fadeValue);
-
-    fadeValue += fadeDirection;
-    if (fadeValue <= 0 || fadeValue >= 255) {
-      fadeDirection = -fadeDirection; // Reverse direction
-    }
-  }
 }
