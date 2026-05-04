@@ -19,6 +19,10 @@ unsigned long lastBlink = 0;
 int blinkFreq = 500; 
 bool blinkEnabled = true;
 bool ledState = LOW;
+int fadeValue = 0;
+int fadeDirection = 5;
+unsigned long lastFadeUpdate = 0;
+bool breathingEnabled = false;
 
 // Audio Variables
 bool toneRunning = false;
@@ -52,28 +56,33 @@ void measureLED() {
   Serial.println("\n--- LED Frequency Measurement (GP25) ---");
   
   if (!blinkEnabled) {
-    Serial.println("Error: LED blinking is OFF. Cannot measure frequency.");
+    Serial.println("Error: LED blinking is OFF.");
     return;
   }
 
-  // Calculate theoretical frequency based on the blinkFreq (interval)
-  // Frequency = 1 / (Period in seconds). Period = blinkFreq * 2 (on + off)
   float theoreticalFreq = 1000.0 / (blinkFreq * 2.0);
-
-  // Hardware measurement attempt
-  // Note: frequency_count_khz is for high speeds. 
-  // For low speeds, we count pulses over 1 second.
-  unsigned long start = millis();
   int pulses = 0;
-  bool lastState = digitalRead(LED_BUILTIN);
+  bool lastState = ledState;
+  unsigned long start = millis();
 
   Serial.println("Measuring for 2 seconds...");
+
   while (millis() - start < 2000) {
-    bool currentState = digitalRead(LED_BUILTIN);
-    if (currentState != lastState) {
-      if (currentState == HIGH) pulses++;
-      lastState = currentState;
+    // Keep the LED blinking logic alive during the measurement loop
+    if (millis() - lastBlink >= (unsigned long)blinkFreq) {
+      lastBlink = millis();
+      ledState = !ledState;
+      digitalWrite(LED_BUILTIN, ledState);
     }
+
+    // Count the transitions
+    if (ledState != lastState) {
+      if (ledState == HIGH) pulses++;
+      lastState = ledState;
+    }
+    
+    // Tiny yield to keep the system stable
+    tight_loop_contents(); 
   }
 
   float measuredFreq = pulses / 2.0;
@@ -156,5 +165,28 @@ void loop() {
     else if (cmd == "i2s stop") toneRunning = false;
     else if (cmd == "i2s measure") measureI2S();
     else if (cmd == "reset") watchdog_reboot(0,0,0);
+    else if (cmd == "blink breathe") {
+        breathingEnabled = true;
+        blinkEnabled = false; // Disable standard blink
+        analogWriteFreq(1000); // 1kHz carrier frequency
+        Serial.println("Breathing enabled.");
+    }
+    else if (cmd == "blink normal") {
+        breathingEnabled = false;
+        blinkEnabled = true;
+        digitalWrite(LED_BUILTIN, LOW);
+        Serial.println("Standard blink enabled.");
+    }
+  }
+
+  // Breathing Logic
+  if (breathingEnabled && (millis() - lastFadeUpdate >= 20)) {
+    lastFadeUpdate = millis();
+    analogWrite(LED_BUILTIN, fadeValue);
+
+    fadeValue += fadeDirection;
+    if (fadeValue <= 0 || fadeValue >= 255) {
+      fadeDirection = -fadeDirection; // Reverse direction
+    }
   }
 }
