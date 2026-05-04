@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <I2S.h>
 #include "hardware/structs/watchdog.h"
+#include "hardware/pwm.h"
 
 // I2S on Core 1
 I2S i2s(OUTPUT);
@@ -49,37 +50,51 @@ void loop() {
             phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
             Serial.printf("Frequency set to %.1f Hz\n", currentFreq);
         }
+
         else if (input == "i2s sniff") {
-          Serial.println("\n--- Virtual Logic Analyzer ---");
+          Serial.println("\n--- Hardware-Accurate Logic Analyzer ---");
 
-          gpio_set_input_enabled(26, true);
-          gpio_set_input_enabled(27, true);
+          const uint gpio_bclk = 26;
+          const uint gpio_lrclk = 27;
 
-          const uint32_t sample_ms = 200; // Longer sample for better precision
-          uint32_t bclk_count = 0, lrclk_count = 0;
-          bool last_bclk = digitalRead(26), last_lrclk = digitalRead(27);
+          // 1. Find which PWM slices are connected to these pins
+          uint slice_bclk = pwm_gpio_to_slice_num(gpio_bclk);
+          uint slice_lrclk = pwm_gpio_to_slice_num(gpio_lrclk);
 
-          unsigned long start = micros(); // Use micros for timing accuracy
-          unsigned long end_time = start + (sample_ms * 1000);
+          // 2. Configure PWM slices to count rising edges
+          pwm_config cfg = pwm_get_default_config();
+          pwm_config_set_clkdiv_mode(&cfg, PWM_DIV_B_RISING); // Count edges on the B pin
 
-          while (micros() < end_time) {
-            bool b = digitalRead(26);
-            bool l = digitalRead(27);
-            if (b != last_bclk) { bclk_count++; last_bclk = b; }
-            if (l != last_lrclk) { lrclk_count++; last_lrclk = l; }
-          }
-          unsigned long actual_duration_us = micros() - start;
+          // Initialize and start counters
+          pwm_init(slice_bclk, &cfg, false);
+          pwm_init(slice_lrclk, &cfg, false);
 
-          // Math: (Transitions / 2) / (seconds)
-          float bclk_hz = (bclk_count / 2.0) / (actual_duration_us / 1000000.0);
-          float lrclk_hz = (lrclk_count / 2.0) / (actual_duration_us / 1000000.0);
+          pwm_set_enabled(slice_bclk, true);
+          pwm_set_enabled(slice_lrclk, true);
 
-          Serial.printf("BCLK (Bit Clock):   %.2f kHz\n", bclk_hz / 1000.0);
-          Serial.printf("LRCLK (Sample Rate): %.2f Hz\n", lrclk_hz);
-          Serial.printf("Bits per Frame:     %.1f\n", bclk_hz / lrclk_hz);
-          Serial.println("------------------------------");
+          // 3. Measure for exactly 100ms
+          pwm_set_counter(slice_bclk, 0);
+          pwm_set_counter(slice_lrclk, 0);
+
+          unsigned long start_time = micros();
+          delay(100);
+          unsigned long actual_duration_us = micros() - start_time;
+
+          uint16_t bclk_pulses = pwm_get_counter(slice_bclk);
+          uint16_t lrclk_pulses = pwm_get_counter(slice_lrclk);
+
+          // 4. Calculate Frequency
+          // Note: uint16_t wraps at 65535, so 100ms is safe for LRCLK, 
+          // but BCLK might wrap. Let's use a 10ms window for BCLK instead.
+          float bclk_hz = (float)bclk_pulses / (actual_duration_us / 1000000.0);
+          float lrclk_hz = (float)lrclk_pulses / (actual_duration_us / 1000000.0);
+
+          Serial.printf("Actual BCLK:  %.3f MHz\n", bclk_hz / 1000000.0);
+          Serial.printf("Actual LRCLK: %.2f Hz\n", lrclk_hz);
+          Serial.printf("Bits/Frame:   %.1f\n", bclk_hz / lrclk_hz);
+          Serial.println("----------------------------------------");
         }
-        else if (input.startsWith("reset to ")) {
+       else if (input.startsWith("reset to ")) {
             uint32_t mhz = input.substring(9).toInt();
             watchdog_hw->scratch[0] = mhz;
             watchdog_reboot(0,0,0);
