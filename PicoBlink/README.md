@@ -1,3 +1,4 @@
+```
 arduino-cli compile --fqbn rp2040:rp2040:rpipico:freq=125 --upload -p /dev/cu.usbmodem14101 PicoBlink
 Board name:                Raspberry Pi Pico
 FQBN:                      rp2040:rp2040:rpipico
@@ -129,4 +130,4 @@ Option:        Upload Method                                           uploadmet
                Picotool                                                uploadmethod=picotool
                Picoprobe/Debugprobe (CMSIS-DAP)                        uploadmethod=picoprobe_cmsis_dap
 Programmers:   ID                                 Name
-
+```

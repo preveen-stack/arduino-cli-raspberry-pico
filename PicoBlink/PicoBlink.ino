@@ -1,153 +1,223 @@
 #include <Arduino.h>
 #include <I2S.h>
-#include <hardware/watchdog.h>
-#include <hardware/clocks.h>
-#include <hardware/adc.h>
 
-// I2S Instance
+#ifdef __cplusplus
+extern "C" {
+#endif
+  #include <hardware/watchdog.h>
+  #include <hardware/clocks.h>
+  #include <hardware/adc.h>
+  #include <hardware/gpio.h>
+#ifdef __cplusplus
+}
+#endif
+
+// --- I2S Instance ---
 I2S i2s(OUTPUT);
 
-// Global Variables
+// --- Global Variables ---
 unsigned long lastBlink = 0;
 int blinkFreq = 500;
 bool blinkEnabled = true;
 bool ledState = LOW;
 
-// Tone Variables
+// --- Tone Generator ---
 bool toneRunning = false;
 float currentFreq = 440.0;
 float phase = 0;
 float phaseIncrement = 0;
 int sampleRate = 44100;
+int bitDepth = 16;
 
 void updatePhaseIncrement() {
-    phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
+  phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
 }
 
+// --- Menu Functions ---
 void printHelp() {
-    Serial.println("\n--- I2S Commands ---");
-    Serial.println("i2s init <sr> <bw> <ch> - Init I2S (e.g., i2s init 44100 16 2)");
-    Serial.println("i2s start               - Start I2S engine");
-    Serial.println("i2s stop                - Stop I2S engine");
-    Serial.println("i2s status              - Show I2S configuration");
-    Serial.println("i2s tone <freq>         - Play sine wave (100-18000 Hz)");
-    Serial.println("--------------------\n");
+  Serial.println("\n========= PICO CONTROL MENU =========");
+  Serial.println("help             - Show this menu");
+  Serial.println("pinout           - Display Pico pinout map");
+  Serial.println("clock            - Show system clock speeds");
+  Serial.println("temp             - Read internal CPU temp");
+  Serial.println("blink on/off     - Toggle onboard LED");
+  Serial.println("blink freq <ms>  - Set LED rate (1-10000)");
+  Serial.println("reset            - Reboot the Pico");
+  Serial.println("\n--- I2S Commands ---");
+  Serial.println("i2s init <sr> <bw> <ch> - e.g., i2s init 44100 16 2");
+  Serial.println("i2s start/stop          - Toggle audio engine");
+  Serial.println("i2s status              - Current I2S config");
+  Serial.println("i2s detail              - PIO logical clock values");
+  Serial.println("i2s tone <freq>         - Set sine wave (100-18000)");
+  Serial.println("i2s measure             - Hardware clock verify");
+  Serial.println("=====================================\n");
 }
 
-void handleI2STone() {
-    if (!toneRunning) return;
+void printPinout() {
+  Serial.println("\n--- Raspberry Pi Pico Pinout ---");
+  Serial.println("      [USB CONNECTOR]      ");
+  Serial.println("GP0  [01] [40] VBUS (5V)");
+  Serial.println("GP1  [02] [39] VSYS");
+  Serial.println("GND  [03] [38] GND");
+  Serial.println("GP28 [34] DOUT (Data)");
+  Serial.println("GP27 [32] LRCLK (Word)");
+  Serial.println("GP26 [31] BCLK (Bit)");
+  Serial.println("--------------------------------\n");
+}
 
-    // Fill I2S buffer if space is available
-    while (i2s.availableForWrite()) {
-        int16_t sample = (int16_t)(sin(phase) * 32767.0f);
-        i2s.write(sample); // Left channel
-        i2s.write(sample); // Right channel (assuming 2 channels)
-        
-        phase += phaseIncrement;
-        if (phase >= 2.0 * PI) phase -= 2.0 * PI;
-    }
+void printClocks() {
+  Serial.println("\n--- System Clocks ---");
+  Serial.printf("System: %.2f MHz\n", rp2040.f_cpu() / 1000000.0);
+  Serial.printf("USB:    48.00 MHz\n");
+  Serial.printf("ADC:    48.00 MHz\n");
+}
+
+void printTemp() {
+  adc_select_input(4);
+  uint16_t raw = adc_read();
+  float voltage = raw * (3.3f / (1 << 12));
+  float temp = 27.0f - (voltage - 0.706f) / 0.001721f;
+  Serial.printf("CPU Temp: %.2f °C\n", temp);
 }
 
 void measureI2S() {
-    Serial.println("\n--- I2S Hardware Clock Measurement ---");
-    
-    // The compiler suggested CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0
-    // This maps the GPIO base to the frequency counter.
-    float bclk = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 26); // GP26
-    float lrclk = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 27); // GP27
+  Serial.println("\n--- Hardware Frequency Counter (Live) ---");
 
-    Serial.printf("BCLK (GP26): %.3f MHz\n", bclk / 1000.0);
-    Serial.printf("LRCLK (GP27): %.2f Hz\n", lrclk * 1000.0);
-    
-    if (lrclk > 0) {
-        float bitsPerFrame = (bclk * 1000.0) / (lrclk * 1000.0);
-        Serial.printf("Detected Bits Per Frame: %.1f\n", bitsPerFrame);
-    }
-    Serial.println("---------------------------------------\n");
+  // Force input buffers ON for these pins so the FC0 can 'see' the PIO output
+  gpio_set_input_enabled(26, true);
+  gpio_set_input_enabled(27, true);
+  
+  // Give the hardware a microsecond to settle
+  delayMicroseconds(10);
+
+  // Re-attempt measurement using the suggested SDK macro
+  uint32_t bclk_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 26);
+  uint32_t lrclk_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 27);
+
+  // If it still shows SysClk, we try the secondary mapping (46 is the GPIO offset)
+  if (lrclk_khz > 100000) { // If it's reporting ~125MHz
+      bclk_khz = frequency_count_khz(46 + 26);
+      lrclk_khz = frequency_count_khz(46 + 27);
+  }
+
+  Serial.printf("BCLK (GP26):  %.3f MHz\n", bclk_khz / 1000.0);
+  Serial.printf("LRCLK (GP27): %u Hz\n", lrclk_khz * 1000);
+
+  if (lrclk_khz > 0 && lrclk_khz < 200000) { // Reasonable audio range
+    Serial.printf("Bits/Frame:    %.1f\n", (float)bclk_khz / (float)lrclk_khz);
+  } else {
+    Serial.println("Note: Hardware counter is still defaulting to SysClk.");
+    Serial.println("Use 'i2s detail' for theoretical verification.");
+  }
 }
 
+void handleI2STone() {
+  if (!toneRunning) return;
+
+  while (i2s.availableForWrite()) {
+    int16_t sample = (int16_t)(sin(phase) * 32767.0f);
+    i2s.write(sample); // Left
+    i2s.write(sample); // Right
+    
+    phase += phaseIncrement;
+    if (phase >= 2.0 * PI) phase -= 2.0 * PI;
+  }
+}
+
+// --- Main Setup & Loop ---
 void setup() {
-    Serial.begin(115200);
-    pinMode(LED_BUILTIN, OUTPUT);
-    adc_init();
-    adc_set_temp_sensor_enabled(true);
-    delay(2000);
-    Serial.println("Pico System Online. Type 'help' for commands.");
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  adc_init();
+  adc_set_temp_sensor_enabled(true);
+  
+  delay(2000);
+  Serial.println("Pico Online. Type 'help' to begin.");
 }
 
 void loop() {
-    // Blinking Logic
-    if (blinkEnabled && (millis() - lastBlink >= (unsigned long)blinkFreq)) {
-        lastBlink = millis();
-        ledState = !ledState;
-        digitalWrite(LED_BUILTIN, ledState);
+  if (blinkEnabled && (millis() - lastBlink >= (unsigned long)blinkFreq)) {
+    lastBlink = millis();
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN, ledState);
+  }
+
+  handleI2STone();
+
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    String cmd = input;
+    cmd.toLowerCase();
+
+    if (cmd == "help") printHelp();
+    else if (cmd == "pinout") printPinout();
+    else if (cmd == "clock") printClocks();
+    else if (cmd == "temp") printTemp();
+    else if (cmd == "reset") {
+      Serial.println("Resetting...");
+      delay(100);
+      watchdog_reboot(0,0,0);
     }
-
-    // Handle I2S Audio Generation
-    handleI2STone();
-
-    // Command Parser
-    if (Serial.available() > 0) {
-        String input = Serial.readStringUntil('\n');
-        input.trim();
-        String lowerInput = input;
-        lowerInput.toLowerCase();
-
-        if (lowerInput == "help") printHelp();
+    else if (cmd == "blink on") blinkEnabled = true;
+    else if (cmd == "blink off") blinkEnabled = false;
+    else if (cmd.startsWith("blink freq ")) {
+      blinkFreq = cmd.substring(11).toInt();
+      Serial.printf("Blink set to %d ms\n", blinkFreq);
+    }
+    
+    // I2S Submenu
+    else if (cmd.startsWith("i2s init ")) {
+      int s1 = cmd.indexOf(' ', 9);
+      int s2 = cmd.indexOf(' ', s1 + 1);
+      sampleRate = cmd.substring(9, s1).toInt();
+      bitDepth = cmd.substring(s1 + 1, s2).toInt();
+      
+      i2s.setDATA(28);
+      i2s.setBCLK(26);
+      i2s.setBitsPerSample(bitDepth);
+      
+      if (i2s.begin(sampleRate)) {
+        // Force inputs to stay enabled so the frequency counter can read them back
+        gpio_set_input_enabled(26, true);
+        gpio_set_input_enabled(27, true);
         
-        // I2S INIT: i2s init <sr> <bitwidth> <channels>
-        else if (lowerInput.startsWith("i2s init ")) {
-            int firstSpace = lowerInput.indexOf(' ', 9);
-            int secondSpace = lowerInput.indexOf(' ', firstSpace + 1);
-            
-            sampleRate = lowerInput.substring(9, firstSpace).toInt();
-            int bitWidth = lowerInput.substring(firstSpace + 1, secondSpace).toInt();
-            int channels = lowerInput.substring(secondSpace + 1).toInt();
-
-            // 1. Configure the pins
-            i2s.setDATA(28); 
-            i2s.setBCLK(26);
-            // WS/LRCLK is automatically BCLK + 1 (GP27) unless set otherwise
-            
-            // 2. Set bit depth (The library expects this separately)
-            i2s.setBitsPerSample(bitWidth);
-            
-            // 3. Start I2S with ONLY the sample rate
-            if (i2s.begin(sampleRate)) {
-                updatePhaseIncrement();
-                Serial.printf("OK: I2S Init %dHz, %d-bit, %d ch\n", sampleRate, bitWidth, channels);
-            } else {
-                Serial.println("ERROR: I2S Init failed.");
-            }
-        }
-        else if (lowerInput == "i2s start") {
-            toneRunning = true;
-            Serial.println("OK: I2S Tone Started");
-        }
-        else if (lowerInput == "i2s stop") {
-            toneRunning = false;
-            Serial.println("OK: I2S Tone Stopped");
-        }
-        else if (lowerInput == "i2s status") {
-            Serial.printf("I2S Status: %s | Freq: %.1f Hz | SR: %d\n", 
-                          toneRunning ? "RUNNING" : "STOPPED", currentFreq, sampleRate);
-        }
-        else if (lowerInput.startsWith("i2s tone ")) {
-            float f = lowerInput.substring(9).toFloat();
-            if (f >= 100 && f <= 18000) {
-                currentFreq = f;
-                updatePhaseIncrement();
-                Serial.printf("OK: Frequency set to %.1f Hz\n", currentFreq);
-            } else {
-                Serial.println("ERROR: Range 100-18000 Hz");
-            }
-        }
-        else if (lowerInput == "i2s measure") {
-            if (!toneRunning) {
-                Serial.println("Warning: I2S is stopped. Clocks may report 0Hz.");
-            }
-            measureI2S();
-        }
-        // ... (Include your previous clock/temp/reset/blink commands here)
+        updatePhaseIncrement();
+        Serial.printf("I2S Ready: %dHz/%dbit\n", sampleRate, bitDepth);
+      }
     }
+    else if (cmd == "i2s start") { toneRunning = true; Serial.println("Audio Started"); }
+    else if (cmd == "i2s stop")  { toneRunning = false; Serial.println("Audio Stopped"); }
+    else if (cmd == "i2s status") {
+      Serial.printf("Status: %s | Freq: %.1fHz | SR: %d\n", toneRunning?"RUN":"STOP", currentFreq, sampleRate);
+    }
+    else if (cmd == "i2s detail") {
+      float sysClk = rp2040.f_cpu();
+      float targetBclk = (float)sampleRate * bitDepth * 2.0f;
+      float pioDiv = sysClk / (targetBclk * 2.0f);
+      Serial.printf("SysClk: %.2f MHz | Target BCLK: %.3f MHz | PIO Div: %.4f\n", sysClk/1e6, targetBclk/1e6, pioDiv);
+    }
+    else if (cmd.startsWith("i2s tone ")) {
+      currentFreq = cmd.substring(9).toFloat();
+      updatePhaseIncrement();
+      Serial.printf("Tone set to %.1f Hz\n", currentFreq);
+    }
+    else if (cmd == "i2s measure") {
+      measureI2S();
+    } else if (cmd == "i2s check") {
+      // Check if the PIO FIFO is being emptied (meaning data is going to pins)
+      bool pioActive = !pio_sm_is_tx_fifo_full(pio0, 0); 
+      Serial.printf("PIO Engine Active: %s\n", pioActive ? "YES" : "NO");
+
+      // Logical verification of the pins
+      Serial.printf("Pin Mapping: BCLK=%d, LRCLK=%d, DOUT=%d\n", 26, 27, 28);
+
+      if (toneRunning) {
+        Serial.println("Result: Engine is pumping data. Hardware is likely pulsing.");
+      } else {
+        Serial.println("Result: Engine is idle.");
+      }
+    }
+  }
 }
