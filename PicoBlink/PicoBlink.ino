@@ -15,6 +15,11 @@ volatile float phase = 0;
 volatile float phaseIncrement = 0;
 volatile int sampleRate = 44100;
 
+volatile int numVoices = 1;      // Start with 1 voice
+volatile float cpuLoad = 0.0;    // Percentage 0-100
+uint32_t workTime = 0;           // Total micros spent calculating
+uint32_t totalTime = 0;          // Total micros elapsed
+                                 //
 // Breathing LED variables
 volatile bool breathingEnabled = true;
 int fadeValue = 0;
@@ -168,6 +173,15 @@ void loop() {
             Serial.println("Status: TIMING MISMATCH");
           }
         }
+        else if (input.startsWith("i2s stress ")) {
+          numVoices = input.substring(11).toInt();
+          Serial.printf("Complexity increased to %d voices.\n", numVoices);
+        }
+        else if (input == "i2s status") {
+          Serial.printf("Sample Rate: %d Hz\n", sampleRate);
+          Serial.printf("CPU Load (Core 1): %.1f%%\n", cpuLoad * 100.0);
+          if (cpuLoad > 0.95) Serial.println("WARNING: Core 1 is near SATURATION!");
+        }
         else if (input.startsWith("reset to ")) {
             uint32_t mhz = input.substring(9).toInt();
             if (mhz >= 10 && mhz <= 250) {
@@ -195,8 +209,47 @@ void setup1() {
     pinMode(LED_BUILTIN, OUTPUT);
     phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
 }
-
 void loop1() {
+    if (requestRestart) {
+        i2s.end();
+        i2s.begin(sampleRate);
+        updatePhaseIncrement();
+        requestRestart = false;
+    }
+
+    if (toneRunning) {
+        uint32_t start_u = micros();
+
+        while (i2s.availableForWrite()) {
+            float mixedSample = 0;
+            
+            // --- The Stress Factor ---
+            // Each voice adds a sin() calculation and a float addition
+            for (int i = 0; i < numVoices; i++) {
+                mixedSample += sin(phase * (i + 1)) * (1.0f / numVoices);
+            }
+
+            int16_t out = (int16_t)(mixedSample * 32767.0f);
+            i2s.write(out); // Left
+            i2s.write(out); // Right
+
+            phase += phaseIncrement;
+            if (phase >= 2.0 * PI) phase -= 2.0 * PI;
+        }
+
+        // Calculate CPU Load every 100ms
+        uint32_t end_u = micros();
+        workTime += (end_u - start_u);
+        
+        static uint32_t lastReport = 0;
+        if (millis() - lastReport >= 100) {
+            cpuLoad = (float)workTime / (1000.0f * 100); // work / 100ms
+            workTime = 0;
+            lastReport = millis();
+        }
+    }
+}
+void loop1_orig() {
     // 1. Check for clock change requests from Core 0
     if (requestRestart) {
         i2s.end();
