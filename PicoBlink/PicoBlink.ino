@@ -1,9 +1,21 @@
 #include <Arduino.h>
+#include <hardware/watchdog.h> // Required for reset functionality
 
 unsigned long lastBlink = 0;
-int blinkFreq = 500; // Default 500ms
+int blinkFreq = 500; 
 bool blinkEnabled = true;
 bool ledState = LOW;
+
+void printHelp() {
+  Serial.println("\n--- Available Commands ---");
+  Serial.println("help             - Show this menu");
+  Serial.println("pinout           - Display Pico pinout map");
+  Serial.println("blink on         - Enable the onboard LED");
+  Serial.println("blink off        - Disable the onboard LED");
+  Serial.println("blink freq <ms>  - Set blink rate (1 - 10000)");
+  Serial.println("reset            - Reboot the Pico");
+  Serial.println("---------------------------\n");
+}
 
 void printPinout() {
   Serial.println("\n--- Raspberry Pi Pico Pinout ---");
@@ -34,12 +46,14 @@ void printPinout() {
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
-  while (!Serial); // Wait for Serial Monitor to open
-  Serial.println("Pico Control Ready. Type 'pinout', 'blink on/off', or 'blink freq <ms>'");
+  
+  // Give the user a moment to open the monitor
+  delay(2000); 
+  Serial.println("Pico System Online. Type 'help' for commands.");
 }
 
 void loop() {
-  // Handle Blinking logic
+  // Blinking logic
   if (blinkEnabled) {
     if (millis() - lastBlink >= (unsigned long)blinkFreq) {
       lastBlink = millis();
@@ -50,34 +64,45 @@ void loop() {
     digitalWrite(LED_BUILTIN, LOW);
   }
 
-  // Handle Serial Commands
+  // Command Parser
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
     input.toLowerCase();
 
-    if (input == "pinout") {
+    if (input == "help") {
+      printHelp();
+    }
+    else if (input == "pinout") {
       printPinout();
     } 
     else if (input == "blink on") {
       blinkEnabled = true;
-      Serial.println("Blinking enabled.");
+      Serial.println("OK: Blinking ON");
     } 
     else if (input == "blink off") {
       blinkEnabled = false;
-      Serial.println("Blinking disabled.");
+      Serial.println("OK: Blinking OFF");
     } 
     else if (input.startsWith("blink freq ")) {
-      String valStr = input.substring(11);
-      int val = valStr.toInt();
+      int val = input.substring(11).toInt();
       if (val >= 1 && val <= 10000) {
         blinkFreq = val;
-        Serial.print("Frequency set to: ");
+        Serial.print("OK: Freq set to ");
         Serial.print(blinkFreq);
-        Serial.println(" ms");
+        Serial.println("ms");
       } else {
-        Serial.println("Error: Frequency must be between 1 and 10000 ms.");
+        Serial.println("ERROR: Range 1-10000ms");
       }
+    }
+    else if (input == "reset") {
+      Serial.println("Rebooting Pico...");
+      delay(500);
+      // Logic: Start watchdog with 1ms timeout to trigger immediate reset
+      watchdog_reboot(0, 0, 0); 
+    }
+    else if (input != "") {
+      Serial.println("Unknown command. Type 'help' for list.");
     }
   }
 }
