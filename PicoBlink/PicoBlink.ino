@@ -49,6 +49,36 @@ void loop() {
             phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
             Serial.printf("Frequency set to %.1f Hz\n", currentFreq);
         }
+        else if (input == "i2s sniff") {
+          Serial.println("\n--- Virtual Logic Analyzer ---");
+
+          gpio_set_input_enabled(26, true);
+          gpio_set_input_enabled(27, true);
+
+          const uint32_t sample_ms = 200; // Longer sample for better precision
+          uint32_t bclk_count = 0, lrclk_count = 0;
+          bool last_bclk = digitalRead(26), last_lrclk = digitalRead(27);
+
+          unsigned long start = micros(); // Use micros for timing accuracy
+          unsigned long end_time = start + (sample_ms * 1000);
+
+          while (micros() < end_time) {
+            bool b = digitalRead(26);
+            bool l = digitalRead(27);
+            if (b != last_bclk) { bclk_count++; last_bclk = b; }
+            if (l != last_lrclk) { lrclk_count++; last_lrclk = l; }
+          }
+          unsigned long actual_duration_us = micros() - start;
+
+          // Math: (Transitions / 2) / (seconds)
+          float bclk_hz = (bclk_count / 2.0) / (actual_duration_us / 1000000.0);
+          float lrclk_hz = (lrclk_count / 2.0) / (actual_duration_us / 1000000.0);
+
+          Serial.printf("BCLK (Bit Clock):   %.2f kHz\n", bclk_hz / 1000.0);
+          Serial.printf("LRCLK (Sample Rate): %.2f Hz\n", lrclk_hz);
+          Serial.printf("Bits per Frame:     %.1f\n", bclk_hz / lrclk_hz);
+          Serial.println("------------------------------");
+        }
         else if (input.startsWith("reset to ")) {
             uint32_t mhz = input.substring(9).toInt();
             watchdog_hw->scratch[0] = mhz;
