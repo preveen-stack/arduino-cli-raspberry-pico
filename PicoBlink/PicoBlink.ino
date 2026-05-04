@@ -1,114 +1,153 @@
 #include <Arduino.h>
+#include <I2S.h>
+#include <hardware/watchdog.h>
+#include <hardware/clocks.h>
+#include <hardware/adc.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-  #include <hardware/watchdog.h>
-  #include <hardware/clocks.h>
-  #include <hardware/adc.h>
-#ifdef __cplusplus
-}
-#endif
+// I2S Instance
+I2S i2s(OUTPUT);
 
+// Global Variables
 unsigned long lastBlink = 0;
-int blinkFreq = 500; 
+int blinkFreq = 500;
 bool blinkEnabled = true;
 bool ledState = LOW;
 
+// Tone Variables
+bool toneRunning = false;
+float currentFreq = 440.0;
+float phase = 0;
+float phaseIncrement = 0;
+int sampleRate = 44100;
+
+void updatePhaseIncrement() {
+    phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
+}
+
 void printHelp() {
-  Serial.println("\n--- Available Commands ---");
-  Serial.println("help             - Show this menu");
-  Serial.println("pinout           - Display Pico pinout map");
-  Serial.println("clock            - Show internal system clock speeds");
-  Serial.println("temp             - Read internal CPU temperature");
-  Serial.println("blink on/off     - Toggle onboard LED");
-  Serial.println("blink freq <ms>  - Set rate (1 - 10000)");
-  Serial.println("reset            - Reboot the Pico");
-  Serial.println("---------------------------\n");
+    Serial.println("\n--- I2S Commands ---");
+    Serial.println("i2s init <sr> <bw> <ch> - Init I2S (e.g., i2s init 44100 16 2)");
+    Serial.println("i2s start               - Start I2S engine");
+    Serial.println("i2s stop                - Stop I2S engine");
+    Serial.println("i2s status              - Show I2S configuration");
+    Serial.println("i2s tone <freq>         - Play sine wave (100-18000 Hz)");
+    Serial.println("--------------------\n");
 }
 
-void printTemp() {
-  adc_select_input(4); // Internal temp sensor is always on ADC 4
-  uint16_t raw = adc_read();
-  const float conversion_factor = 3.3f / (1 << 12);
-  float voltage = raw * conversion_factor;
-  float temp = 27.0f - (voltage - 0.706f) / 0.001721f;
+void handleI2STone() {
+    if (!toneRunning) return;
 
-  Serial.print("CPU Temperature: ");
-  Serial.print(temp, 2);
-  Serial.println(" °C");
+    // Fill I2S buffer if space is available
+    while (i2s.availableForWrite()) {
+        int16_t sample = (int16_t)(sin(phase) * 32767.0f);
+        i2s.write(sample); // Left channel
+        i2s.write(sample); // Right channel (assuming 2 channels)
+        
+        phase += phaseIncrement;
+        if (phase >= 2.0 * PI) phase -= 2.0 * PI;
+    }
 }
 
-void printClocks() {
-  Serial.println("\n--- RP2040 Clock Frequencies ---");
+void measureI2S() {
+    Serial.println("\n--- I2S Hardware Clock Measurement ---");
+    
+    // The compiler suggested CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0
+    // This maps the GPIO base to the frequency counter.
+    float bclk = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 26); // GP26
+    float lrclk = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0 + 27); // GP27
 
-  // These calls are baked into the Arduino RP2040 core
-  Serial.print("System Clock: ");
-  Serial.print(rp2040.f_cpu() / 1000000.0);
-  Serial.println(" MHz");
-
-  // These constants are usually defined, but let's use the object for safety
-  Serial.print("USB Clock:    48.00 MHz (Fixed)");
-  Serial.println();
-
-  Serial.print("ADC Clock:    48.00 MHz (Fixed)");
-  Serial.println();
-
-  Serial.println("--------------------------------\n");
-}
-
-
-void printPinout() {
-  Serial.println("\n--- Raspberry Pi Pico Pinout ---");
-  Serial.println("GP0 [01] [40] VBUS | GP1 [02] [39] VSYS");
-  Serial.println("GND [03] [38] GND  | GP2 [04] [37] 3V3_EN");
-  // ... (Full text from previous step)
+    Serial.printf("BCLK (GP26): %.3f MHz\n", bclk / 1000.0);
+    Serial.printf("LRCLK (GP27): %.2f Hz\n", lrclk * 1000.0);
+    
+    if (lrclk > 0) {
+        float bitsPerFrame = (bclk * 1000.0) / (lrclk * 1000.0);
+        Serial.printf("Detected Bits Per Frame: %.1f\n", bitsPerFrame);
+    }
+    Serial.println("---------------------------------------\n");
 }
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
-  
-  // Initialize ADC for temperature sensor
-  adc_init();
-  adc_set_temp_sensor_enabled(true);
-  
-  delay(2000); 
-  Serial.println("Pico System Online. Type 'help' for commands.");
+    Serial.begin(115200);
+    pinMode(LED_BUILTIN, OUTPUT);
+    adc_init();
+    adc_set_temp_sensor_enabled(true);
+    delay(2000);
+    Serial.println("Pico System Online. Type 'help' for commands.");
 }
 
 void loop() {
-  if (blinkEnabled && (millis() - lastBlink >= (unsigned long)blinkFreq)) {
-    lastBlink = millis();
-    ledState = !ledState;
-    digitalWrite(LED_BUILTIN, ledState);
-  }
+    // Blinking Logic
+    if (blinkEnabled && (millis() - lastBlink >= (unsigned long)blinkFreq)) {
+        lastBlink = millis();
+        ledState = !ledState;
+        digitalWrite(LED_BUILTIN, ledState);
+    }
 
-  if (Serial.available() > 0) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    input.toLowerCase();
+    // Handle I2S Audio Generation
+    handleI2STone();
 
-    if (input == "help") printHelp();
-    else if (input == "pinout") printPinout();
-    else if (input == "clock") printClocks();
-    else if (input == "temp") printTemp();
-    else if (input == "blink on") { blinkEnabled = true; Serial.println("Blinking ON"); }
-    else if (input == "blink off") { blinkEnabled = false; Serial.println("Blinking OFF"); }
-    else if (input.startsWith("blink freq ")) {
-      int val = input.substring(11).toInt();
-      if (val >= 1 && val <= 10000) {
-        blinkFreq = val;
-        Serial.printf("Freq set to %d ms\n", blinkFreq);
-      }
+    // Command Parser
+    if (Serial.available() > 0) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+        String lowerInput = input;
+        lowerInput.toLowerCase();
+
+        if (lowerInput == "help") printHelp();
+        
+        // I2S INIT: i2s init <sr> <bitwidth> <channels>
+        else if (lowerInput.startsWith("i2s init ")) {
+            int firstSpace = lowerInput.indexOf(' ', 9);
+            int secondSpace = lowerInput.indexOf(' ', firstSpace + 1);
+            
+            sampleRate = lowerInput.substring(9, firstSpace).toInt();
+            int bitWidth = lowerInput.substring(firstSpace + 1, secondSpace).toInt();
+            int channels = lowerInput.substring(secondSpace + 1).toInt();
+
+            // 1. Configure the pins
+            i2s.setDATA(28); 
+            i2s.setBCLK(26);
+            // WS/LRCLK is automatically BCLK + 1 (GP27) unless set otherwise
+            
+            // 2. Set bit depth (The library expects this separately)
+            i2s.setBitsPerSample(bitWidth);
+            
+            // 3. Start I2S with ONLY the sample rate
+            if (i2s.begin(sampleRate)) {
+                updatePhaseIncrement();
+                Serial.printf("OK: I2S Init %dHz, %d-bit, %d ch\n", sampleRate, bitWidth, channels);
+            } else {
+                Serial.println("ERROR: I2S Init failed.");
+            }
+        }
+        else if (lowerInput == "i2s start") {
+            toneRunning = true;
+            Serial.println("OK: I2S Tone Started");
+        }
+        else if (lowerInput == "i2s stop") {
+            toneRunning = false;
+            Serial.println("OK: I2S Tone Stopped");
+        }
+        else if (lowerInput == "i2s status") {
+            Serial.printf("I2S Status: %s | Freq: %.1f Hz | SR: %d\n", 
+                          toneRunning ? "RUNNING" : "STOPPED", currentFreq, sampleRate);
+        }
+        else if (lowerInput.startsWith("i2s tone ")) {
+            float f = lowerInput.substring(9).toFloat();
+            if (f >= 100 && f <= 18000) {
+                currentFreq = f;
+                updatePhaseIncrement();
+                Serial.printf("OK: Frequency set to %.1f Hz\n", currentFreq);
+            } else {
+                Serial.println("ERROR: Range 100-18000 Hz");
+            }
+        }
+        else if (lowerInput == "i2s measure") {
+            if (!toneRunning) {
+                Serial.println("Warning: I2S is stopped. Clocks may report 0Hz.");
+            }
+            measureI2S();
+        }
+        // ... (Include your previous clock/temp/reset/blink commands here)
     }
-    else if (input == "reset") {
-      Serial.println("Rebooting...");
-      delay(100);
-      watchdog_reboot(0, 0, 0); 
-    }
-    else if (input != "") {
-      Serial.println("Unknown command. Type 'help'.");
-    }
-  }
 }
