@@ -2,6 +2,7 @@
 #include <I2S.h>
 #include "hardware/structs/watchdog.h"
 #include "hardware/pwm.h"
+#include "hardware/adc.h"
 
 // --- I2S Instance ---
 I2S i2s(OUTPUT);
@@ -19,6 +20,37 @@ volatile bool breathingEnabled = true;
 int fadeValue = 0;
 int fadeDirection = 5;
 unsigned long lastFadeUpdate = 0;
+
+void updatePhaseIncrement() {
+    // Formula: (2 * PI * Frequency) / SampleRate
+    phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
+}
+
+#include "hardware/adc.h"
+
+float get_internal_temp() {
+    // 1. Initialize the ADC hardware
+    adc_init();
+    
+    // 2. Enable the internal temperature sensor
+    adc_set_temp_sensor_enabled(true);
+    
+    // 3. Select ADC channel 4 (the internal temp sensor)
+    adc_select_input(4);
+    
+    // 4. Read the raw value (12-bit: 0-4095)
+    uint16_t raw = adc_read();
+    
+    // 5. Convert to Voltage
+    const float conversion_factor = 3.3f / (1 << 12);
+    float voltage = raw * conversion_factor;
+    
+    // 6. Convert Voltage to Degrees Celsius
+    // Formula from RP2040 Datasheet: T = 27 - (Voltage - 0.706)/0.001721
+    float tempC = 27.0f - (voltage - 0.706f) / 0.001721f;
+    
+    return tempC;
+}
 
 // ==========================================
 // CORE 0: Serial Watch & Command Interface
@@ -55,6 +87,32 @@ void loop() {
         else if (input == "clock") {
             Serial.printf("Current Clock: %.2f MHz\n", rp2040.f_cpu()/1000000.0);
         }
+        else if (input.startsWith("i2s config ")) {
+          // Expected format: i2s config <sr> <bits> <ch>
+          // Example: i2s config 48000 16 2
+          int s1 = input.indexOf(' ', 11);
+          int s2 = input.indexOf(' ', s1 + 1);
+
+          sampleRate = input.substring(11, s1).toInt();
+          int bitWidth = input.substring(s1 + 1, s2).toInt();
+          int channels = input.substring(s2 + 1).toInt();
+
+          i2s.end();
+          if (i2s.begin(sampleRate)) {
+            // Manually calculate and force the hardware divisor for the new config
+            // Total Bits per Frame = bitWidth * channels
+            float target_div = (float)rp2040.f_cpu() / (sampleRate * bitWidth * channels * 2.0f);
+
+            uint16_t div_int = (uint16_t)target_div;
+            uint8_t div_frac = (uint8_t)((target_div - div_int) * 256.0f);
+            pio0->sm[0].clkdiv = (div_int << 16) | (div_frac << 8);
+
+            updatePhaseIncrement(); // Ensure the sine wave sounds correct at new SR
+
+            Serial.printf("Configured: %dHz, %d-bit, %d-ch\n", sampleRate, bitWidth, channels);
+            Serial.printf("New Hardware Divisor: %.4f\n", target_div);
+          }
+        }
         else if (input == "i2s start") {
           i2s.begin(sampleRate); 
 
@@ -85,20 +143,30 @@ void loop() {
             Serial.printf("Tone: %.1f Hz\n", currentFreq);
         }
         else if (input == "i2s sniff") {
-            Serial.println("\n--- PIO Internal Register Sniff ---");
-            uint32_t sys_clk = rp2040.f_cpu();
-            uint32_t div_reg = pio0->sm[0].clkdiv;
-            float pio_divider = (float)(div_reg >> 16) + (float)((div_reg & 0xFFFF) >> 8) / 256.0f;
-            
-            if (pio_divider < 1.0f) pio_divider = 1.0f;
+          uint32_t sys_clk = rp2040.f_cpu();
+          uint32_t div_reg = pio0->sm[0].clkdiv;
+          float pio_divider = (float)(div_reg >> 16) + (float)((div_reg & 0xFFFF) >> 8) / 256.0f;
 
-            float calc_bclk = (float)sys_clk / (pio_divider * 2.0f);
-            float calc_lrclk = calc_bclk / 32.0f; 
+          // Measure actual hardware speed
+          float calc_bclk = (float)sys_clk / (pio_divider * 2.0f);
 
-            Serial.printf("Hardware Divisor: %.4f\n", pio_divider);
-            Serial.printf("Measured BCLK:    %.3f MHz\n", calc_bclk / 1000000.0);
-            Serial.printf("Measured LRCLK:   %.2f Hz\n", calc_lrclk);
-            Serial.println("------------------------------------");
+          // We can't know the bitwidth from the register, 
+          // so we compare BCLK to LRCLK to "discover" it.
+          float calc_lrclk = (float)sys_clk / (pio_divider * 2.0f * 32.0f); // Default 32-bit frame
+
+          Serial.println("\n--- Real-Time Hardware Verification ---");
+          Serial.printf("BCLK (Bit Clock):   %.3f MHz\n", calc_bclk / 1000000.0);
+          Serial.printf("LRCLK (Sample Rate): %.2f Hz\n", calc_lrclk);
+
+          // Discovery Logic: How many bits are in one sample period?
+          float discovered_bits = calc_bclk / calc_lrclk;
+          Serial.printf("Bits Per Frame:     %.0f\n", discovered_bits);
+
+          if (abs(calc_lrclk - sampleRate) < 100) {
+            Serial.println("Status: TIMING MATCHED");
+          } else {
+            Serial.println("Status: TIMING MISMATCH");
+          }
         }
         else if (input.startsWith("reset to ")) {
             uint32_t mhz = input.substring(9).toInt();
@@ -108,6 +176,10 @@ void loop() {
                 delay(100);
                 watchdog_reboot(0,0,0);
             }
+        } else if (input == "temp") { 
+            Serial.printf("Temp: %.0f\n", get_internal_temp());
+        } else {
+          Serial.print("Unknown Command\n");
         }
     }
 }
