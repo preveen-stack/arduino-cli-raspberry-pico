@@ -30,20 +30,19 @@ bool snifferInitialized = false;
 
 // --- PIO Program: Measures cycles between rising edges ---
 const uint16_t capture_program_instructions[] = {
-    0xa02b, // 0: mov x, !null     ; Reset X (32-bit max)
-    0x2020, // 1: wait 0 pin 0     ; Wait for pin to be LOW
-    0x20a0, // 2: wait 1 pin 0     ; Wait for rising edge (Start)
-    0x0044, // 3: jmp x-- 4        ; Decrement X (Loop start)
-    0x2020, // 4: wait 0 pin 0     ; Wait for pin to be LOW
-    0x00c7, // 5: jmp pin 7        ; If pin is HIGH, we found next edge
-    0x00c5, // 6: jmp 5            ; Keep waiting for HIGH
-    0x20a0, // 7: wait 1 pin 0     ; Confirm rising edge
-    0x8020, // 8: push block       ; Push remaining X value to FIFO
+    0xa02b, // 0: mov x, !null     
+    0x20a0, // 1: wait 1 pin 0     ; Just wait for ANY rising edge
+    0x0043, // 2: jmp x-- 3        ; Decrement X
+    0x2020, // 3: wait 0 pin 0     ; Wait for Low
+    0x20a0, // 4: wait 1 pin 0     ; Wait for High
+    0x8020, // 5: push block       ; Push result
+    0x0000, // 6: jmp 0            ; Restart
 };
-
+// Update the length in capture_program to 7
+//
 const struct pio_program capture_program = {
     .instructions = capture_program_instructions,
-    .length = 9,
+    .length = 7,
     .origin = -1,
 };
 
@@ -61,34 +60,37 @@ float get_internal_temp() {
     return 27.0f - (voltage - 0.706f) / 0.001721f;
 }
 
+#include "hardware/regs/pads_bank0.h"
+
 void setup_dma_sniffer(uint pin) {
     if (snifferInitialized) return;
 
     uint offset = pio_add_program(capture_pio, &capture_program);
+    
+    // 1. FORCE THE INPUT BUFFER OPEN
+    // By default, when a pin is an output, the input buffer might be disabled.
+    // We force it on so PIO1 can "see" what PIO0 is doing.
+    hw_write_masked(&pads_bank0_hw->io[pin],
+                   PADS_BANK0_GPIO0_IE_BITS, // Input Enable
+                   PADS_BANK0_GPIO0_IE_BITS);
 
-    // 1. Bridge the GPIO to PIO1
+    // 2. Initialise the GPIO for PIO use
     pio_gpio_init(capture_pio, pin);
-
-    // 2. Configure the State Machine Hardware
+    
+    // 3. Configure State Machine
     pio_sm_config c = pio_get_default_sm_config();
+    sm_config_set_in_pins(&c, pin);    // Input starts at GP26
+    sm_config_set_jmp_pin(&c, pin);   // JMP pin is also GP26
+    sm_config_set_clkdiv(&c, 1.0f); 
 
-    // This tells the 'wait' and 'in' instructions which pin is index 0
-    sm_config_set_in_pins(&c, pin);
-
-    // This tells the 'jmp pin' instruction which pin to check
-    sm_config_set_jmp_pin(&c, pin);
-
-    sm_config_set_clkdiv(&c, 1.0f);
-
-    // 3. Apply and Start
     pio_sm_init(capture_pio, pio_sm_capture, offset, &c);
-
-    // Ensure the PIO considers this pin an input for its internal logic
+    
+    // 4. Set Pin Direction internally for PIO1
     pio_sm_set_consecutive_pindirs(capture_pio, pio_sm_capture, pin, 1, false);
-
+    
     pio_sm_set_enabled(capture_pio, pio_sm_capture, true);
 
-    // 4. DMA Configuration
+    // 5. DMA Config
     dma_chan = dma_claim_unused_channel(false);
     if (dma_chan >= 0) {
         dma_channel_config dc = dma_channel_get_default_config(dma_chan);
