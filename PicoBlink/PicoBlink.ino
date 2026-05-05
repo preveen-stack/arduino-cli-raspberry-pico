@@ -57,6 +57,59 @@ float get_internal_temp() {
     return tempC;
 }
 
+#include "hardware/dma.h"
+#include "hardware/pio.h"
+
+// --- PIO Assembly for Frequency Capture ---
+// Counts cycles between rising edges on a pin
+const uint16_t capture_program_instructions[] = {
+    0xa02b, // 0: mov x, !null      ; Reset X to max (0xFFFFFFFF)
+    0x2020, // 1: wait 0 pin 0      ; Wait for low
+    0x20a0, // 2: wait 1 pin 0      ; Wait for rising edge
+    0x0044, // 3: jmp x-- 4         ; Decrement X
+    0x2020, // 4: wait 0 pin 0      ; Start counting: wait for low
+    0x00c7, // 5: jmp pin 7         ; If pin still high, keep counting
+    0x00c5, // 6: jmp 5             ; Loop
+    0x20a0, // 7: wait 1 pin 0      ; Wait for next rising edge
+    0x8020, // 8: push block        ; Push X (the remaining count) to FIFO
+};
+
+const struct pio_program capture_program = {
+    .instructions = capture_program_instructions,
+    .length = 9,
+    .origin = -1,
+};
+
+// --- DMA Variables ---
+#define CAPTURE_SAMPLES 1024
+uint32_t dma_results[CAPTURE_SAMPLES];
+int dma_chan;
+uint pio_sm_capture = 0;
+
+void setup_dma_sniffer(uint pin) {
+    PIO pio = pio1; // Use the second PIO block
+    uint offset = pio_add_program(pio, &capture_program);
+
+    pio_sm_config c = pio_get_default_sm_config();
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_clkdiv(&c, 1.0f); // Run at full system speed
+
+    pio_sm_init(pio, pio_sm_capture, offset, &c);
+    pio_sm_set_enabled(pio, pio_sm_capture, true);
+
+    // Setup DMA
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config dc = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc, false);
+    channel_config_set_write_increment(&dc, true);
+    channel_config_set_dreq(&dc, pio_get_dreq(pio, pio_sm_capture, false));
+
+//    dma_channel_configure(dma_chan, &dc, dma_results, &pio->hw->rd_fifo[pio_sm_capture], CAPTURE_SAMPLES, false);
+    dma_channel_configure(dma_chan, &dc, dma_results, &pio->rxf[pio_sm_capture], CAPTURE_SAMPLES, false);
+}
+
 // ==========================================
 // CORE 0: Serial Watch & Command Interface
 // ==========================================
@@ -182,6 +235,32 @@ void loop() {
           Serial.printf("CPU Load (Core 1): %.1f%%\n", cpuLoad * 100.0);
           if (cpuLoad > 0.95) Serial.println("WARNING: Core 1 is near SATURATION!");
         }
+        else if (input == "i2s dmasniff") {
+          // Start the hardware capture
+          dma_channel_set_write_addr(dma_chan, dma_results, true);
+
+          Serial.print("Capturing 1024 BCLK pulses...");
+          dma_channel_wait_for_finish_blocking(dma_chan);
+          Serial.println(" Done.");
+
+          // Process the results
+          double total_cycles = 0;
+          for (int i = 1; i < CAPTURE_SAMPLES; i++) {
+            // PIO counts down, so delta is (Previous - Current)
+            uint32_t delta = dma_results[i-1] - dma_results[i];
+            total_cycles += delta;
+          }
+
+          double avg_cycles = total_cycles / (CAPTURE_SAMPLES - 1);
+          double measured_bclk = (double)rp2040.f_cpu() / avg_cycles;
+
+          Serial.println("\n--- DMA Hardware Logic Analyzer ---");
+          Serial.printf("System Clock:  %.2f MHz\n", rp2040.f_cpu() / 1000000.0);
+          Serial.printf("BCLK Period:   %.2f cycles\n", avg_cycles);
+          Serial.printf("Measured BCLK: %.4f MHz\n", measured_bclk / 1000000.0);
+          Serial.printf("Measured LRCLK:%.2f Hz\n", (measured_bclk / 32.0));
+          Serial.println("-----------------------------------");
+        }
         else if (input.startsWith("reset to ")) {
             uint32_t mhz = input.substring(9).toInt();
             if (mhz >= 10 && mhz <= 250) {
@@ -193,7 +272,7 @@ void loop() {
         } else if (input == "temp") { 
             Serial.printf("Temp: %.0f\n", get_internal_temp());
         } else {
-          Serial.print("Unknown Command\n");
+          Serial.print("Unknown Command. type help for list of commands\n");
         }
     }
 }
@@ -205,6 +284,7 @@ void setup1() {
     i2s.setDATA(28);
     i2s.setBCLK(26);
     i2s.begin(sampleRate);
+    setup_dma_sniffer(26);
     
     pinMode(LED_BUILTIN, OUTPUT);
     phaseIncrement = (2.0 * PI * currentFreq) / (float)sampleRate;
