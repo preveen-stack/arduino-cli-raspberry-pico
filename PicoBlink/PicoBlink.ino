@@ -65,17 +65,31 @@ void setup_dma_sniffer(uint pin) {
     if (snifferInitialized) return;
 
     uint offset = pio_add_program(capture_pio, &capture_program);
+
+    // 1. Bridge the GPIO to PIO1
     pio_gpio_init(capture_pio, pin);
 
+    // 2. Configure the State Machine Hardware
     pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_in_pins(&c, pin);
-    sm_config_set_jmp_pin(&c, pin);
-    sm_config_set_clkdiv(&c, 1.0f); 
 
+    // This tells the 'wait' and 'in' instructions which pin is index 0
+    sm_config_set_in_pins(&c, pin);
+
+    // This tells the 'jmp pin' instruction which pin to check
+    sm_config_set_jmp_pin(&c, pin);
+
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    // 3. Apply and Start
     pio_sm_init(capture_pio, pio_sm_capture, offset, &c);
+
+    // Ensure the PIO considers this pin an input for its internal logic
+    pio_sm_set_consecutive_pindirs(capture_pio, pio_sm_capture, pin, 1, false);
+
     pio_sm_set_enabled(capture_pio, pio_sm_capture, true);
 
-    dma_chan = dma_claim_unused_channel(false); // Safety: don't panic if busy
+    // 4. DMA Configuration
+    dma_chan = dma_claim_unused_channel(false);
     if (dma_chan >= 0) {
         dma_channel_config dc = dma_channel_get_default_config(dma_chan);
         channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
